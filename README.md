@@ -361,4 +361,6 @@ Each engine runs on its own vast.ai H100 SXM 80GB instance -- separate GPUs, cle
 
 See [docs/arch.md](docs/arch.md) for the full forward pass trace, [docs/benchmark-history.md](docs/benchmark-history.md) for optimization history, and [docs/cutlass-epilogue-spec.md](docs/cutlass-epilogue-spec.md) for the CUTLASS fusion roadmap.
 
+For manual GitHub Actions runs on a self-hosted Linux/NVIDIA runner, see [docs/gpu-ci-self-hosted.md](docs/gpu-ci-self-hosted.md).
+
 To run the full lifecycle race yourself, see [Reproduce the Benchmark](#reproduce-the-benchmark) at the top.
