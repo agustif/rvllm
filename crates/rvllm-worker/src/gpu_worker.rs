@@ -307,6 +307,31 @@ impl Fp8KVCache {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchPhase {
+    Prefill,
+    Decode,
+    Mixed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardPathKind {
+    GraphReplay,
+    GraphCapture,
+    RawDecode,
+    RawPrefill,
+}
+
+#[derive(Debug, Default)]
+struct HotPathTelemetry {
+    mixed_splits: u64,
+    decode_reuse_prepares: u64,
+    graph_replay_steps: u64,
+    graph_capture_steps: u64,
+    raw_decode_steps: u64,
+    raw_prefill_steps: u64,
+}
+
 /// Single-GPU worker that owns the model weights and cuBLAS handle for
 /// real inference on one CUDA device.
 pub struct GpuWorker {
@@ -347,6 +372,10 @@ pub struct GpuWorker {
     runner_stream: GpuStream,
     /// Number of forward calls so far (for warmup before graph capture).
     forward_count: usize,
+    /// Reusable decode-only scratch to avoid per-step heap churn in the hot path.
+    decode_input_scratch: input::DecodeInputScratch,
+    /// Counters describing how the worker hot path behaves over time.
+    hot_path_telemetry: HotPathTelemetry,
     /// Pinned host buffer for async DtoH pipeline. Allocated on first use.
     #[cfg(feature = "cuda")]
     pinned_output: Option<cudarc::driver::PinnedHostSlice<i32>>,
@@ -471,6 +500,8 @@ impl GpuWorker {
             #[cfg(feature = "cuda")]
             runner_stream,
             forward_count: 0,
+            decode_input_scratch: input::DecodeInputScratch::default(),
+            hot_path_telemetry: HotPathTelemetry::default(),
             #[cfg(feature = "cuda")]
             pinned_output: None,
             pending_sync_output: None,
@@ -1143,6 +1174,68 @@ impl GpuWorker {
         })
     }
 
+    fn batch_phase(metadata: &[SequenceGroupMetadata]) -> Option<BatchPhase> {
+        if metadata.is_empty() {
+            return None;
+        }
+
+        let has_prefill = metadata.iter().any(|group| group.is_prompt);
+        let has_decode = metadata.iter().any(|group| !group.is_prompt);
+
+        Some(match (has_prefill, has_decode) {
+            (true, true) => BatchPhase::Mixed,
+            (true, false) => BatchPhase::Prefill,
+            (false, true) => BatchPhase::Decode,
+            (false, false) => unreachable!(),
+        })
+    }
+
+    fn prepare_model_input(&mut self, metadata: &[SequenceGroupMetadata]) -> Result<ModelInput> {
+        if matches!(Self::batch_phase(metadata), Some(BatchPhase::Decode)) {
+            self.hot_path_telemetry.decode_reuse_prepares += 1;
+            return input::prepare_decode_reuse(
+                &mut self.decode_input_scratch,
+                metadata,
+                self.config.block_size,
+            );
+        }
+
+        input::prepare_input(metadata, self.config.block_size)
+    }
+
+    fn record_forward_path(
+        &mut self,
+        kind: ForwardPathKind,
+        batch: usize,
+        padded_batch: Option<usize>,
+    ) {
+        match kind {
+            ForwardPathKind::GraphReplay => self.hot_path_telemetry.graph_replay_steps += 1,
+            ForwardPathKind::GraphCapture => self.hot_path_telemetry.graph_capture_steps += 1,
+            ForwardPathKind::RawDecode => self.hot_path_telemetry.raw_decode_steps += 1,
+            ForwardPathKind::RawPrefill => self.hot_path_telemetry.raw_prefill_steps += 1,
+        }
+
+        debug!(
+            path = ?kind,
+            batch,
+            padded_batch,
+            "worker forward path selected"
+        );
+
+        if self.forward_count % 64 == 0 && self.forward_count > 0 {
+            info!(
+                graph_replay_steps = self.hot_path_telemetry.graph_replay_steps,
+                graph_capture_steps = self.hot_path_telemetry.graph_capture_steps,
+                raw_decode_steps = self.hot_path_telemetry.raw_decode_steps,
+                raw_prefill_steps = self.hot_path_telemetry.raw_prefill_steps,
+                mixed_splits = self.hot_path_telemetry.mixed_splits,
+                decode_reuse_prepares = self.hot_path_telemetry.decode_reuse_prepares,
+                "HOT_PATH summary"
+            );
+        }
+    }
+
     /// Run a forward pass returning raw logits (no sampling).
     /// Used by speculative decoding to get probability distributions for
     /// verification against draft model outputs.
@@ -1150,7 +1243,7 @@ impl GpuWorker {
         if metadata.is_empty() {
             return Ok(Vec::new());
         }
-        let model_input = input::prepare_input(metadata, self.config.block_size)?;
+        let model_input = self.prepare_model_input(metadata)?;
         self.gpu_forward(&model_input)
     }
 
@@ -1161,7 +1254,7 @@ impl GpuWorker {
         if metadata.is_empty() {
             return Ok(None);
         }
-        let model_input = input::prepare_input(metadata, self.config.block_size)?;
+        let model_input = self.prepare_model_input(metadata)?;
         let greedy_only = Self::all_greedy(metadata);
         let fwd_output = self.gpu_forward_ex(&model_input, greedy_only)?;
         match fwd_output {
@@ -1232,7 +1325,7 @@ impl GpuWorker {
             return Ok(GpuWorkerOutput { outputs: Vec::new() });
         }
 
-        let model_input = input::prepare_input(metadata, self.config.block_size)?;
+        let model_input = self.prepare_model_input(metadata)?;
         let greedy_only = Self::all_greedy(metadata);
         let fwd_output = self.gpu_forward_ex(&model_input, greedy_only)?;
 
@@ -1262,7 +1355,7 @@ impl GpuWorker {
             return Ok(GpuWorkerOutput { outputs: Vec::new() });
         }
 
-        let model_input = input::prepare_input(metadata, self.config.block_size)?;
+        let model_input = self.prepare_model_input(metadata)?;
         let greedy_only = Self::all_greedy(metadata);
         let fwd_output = self.gpu_forward_ex(&model_input, greedy_only)?;
 
@@ -1302,6 +1395,7 @@ impl GpuWorker {
 
         let (prefill, decode) = Self::split_phase_metadata(metadata);
         if !prefill.is_empty() && !decode.is_empty() {
+            self.hot_path_telemetry.mixed_splits += 1;
             debug!(
                 prefill_groups = prefill.len(),
                 decode_groups = decode.len(),
@@ -1327,6 +1421,7 @@ impl GpuWorker {
 
         let (prefill, decode) = Self::split_phase_metadata(metadata);
         if !prefill.is_empty() && !decode.is_empty() {
+            self.hot_path_telemetry.mixed_splits += 1;
             debug!(
                 prefill_groups = prefill.len(),
                 decode_groups = decode.len(),
@@ -1406,7 +1501,7 @@ impl GpuWorker {
             }));
         }
 
-        let model_input = input::prepare_input(metadata, self.config.block_size)?;
+        let model_input = self.prepare_model_input(metadata)?;
         let greedy_only = Self::all_greedy(metadata);
         let fwd_output = self.gpu_forward_ex(&model_input, greedy_only)?;
 
@@ -1556,6 +1651,7 @@ impl GpuWorker {
         greedy_only: bool,
     ) -> Result<ForwardOutput> {
         self.forward_count += 1;
+        let batch = model_input.num_tokens();
 
         // FP8 KV pre-forward: dequantize FP8 blocks back to f16 cache so
         // the attention kernel reads correct data.
@@ -1571,36 +1667,62 @@ impl GpuWorker {
             && model_input.attention_metadata.query_lens.iter().all(|&q| q == 1);
 
         let result = if !is_decode || !self.graph_runner.is_enabled() {
-            self.raw_gpu_forward_ex(model_input, greedy_only)
+            let path = if is_decode {
+                ForwardPathKind::RawDecode
+            } else {
+                ForwardPathKind::RawPrefill
+            };
+            let output = self.raw_gpu_forward_ex(model_input, greedy_only);
+            self.record_forward_path(path, batch, None);
+            output
         } else {
             #[cfg(feature = "cuda")]
             {
-                let batch = model_input.num_tokens();
                 let padded = Self::padded_batch_size(batch);
 
                 // 1. Check for padded graph (hot path)
                 if self.graph_runner.has_graph_for_exact(padded) {
-                    self.gpu_forward_ex_graphed_padded(model_input, batch, padded, greedy_only)
+                    let output =
+                        self.gpu_forward_ex_graphed_padded(model_input, batch, padded, greedy_only);
+                    self.record_forward_path(ForwardPathKind::GraphReplay, batch, Some(padded));
+                    output
                 } else if self.forward_count > Self::GRAPH_WARMUP_CALLS
                     && !self.graph_runner.was_capture_attempted(padded)
                 {
                     // 2. Past warmup? Capture a graph for this padded batch size
                     match self.try_capture_graph_padded(model_input, batch, padded, greedy_only) {
-                        Ok(output) => Ok(output),
+                        Ok(output) => {
+                            self.record_forward_path(
+                                ForwardPathKind::GraphCapture,
+                                batch,
+                                Some(padded),
+                            );
+                            Ok(output)
+                        }
                         Err(e) => {
                             warn!(padded, "graph capture failed, raw forward: {e}");
-                            self.raw_gpu_forward_ex(model_input, greedy_only)
+                            let output = self.raw_gpu_forward_ex(model_input, greedy_only);
+                            self.record_forward_path(
+                                ForwardPathKind::RawDecode,
+                                batch,
+                                Some(padded),
+                            );
+                            output
                         }
                     }
                 } else {
                     // 3. Fallback: raw forward (pre-warmup or capture failure)
-                    self.raw_gpu_forward_ex(model_input, greedy_only)
+                    let output = self.raw_gpu_forward_ex(model_input, greedy_only);
+                    self.record_forward_path(ForwardPathKind::RawDecode, batch, Some(padded));
+                    output
                 }
             }
 
             #[cfg(not(feature = "cuda"))]
             {
-                self.raw_gpu_forward_ex(model_input, greedy_only)
+                let output = self.raw_gpu_forward_ex(model_input, greedy_only);
+                self.record_forward_path(ForwardPathKind::RawDecode, batch, None);
+                output
             }
         };
 
@@ -1912,7 +2034,7 @@ impl GpuWorker {
         if metadata.is_empty() {
             return Ok(Vec::new());
         }
-        let model_input = input::prepare_input(metadata, self.config.block_size)?;
+        let model_input = self.prepare_model_input(metadata)?;
         #[cfg(feature = "cuda")]
         {
             let runner = self.gpu_model_runner.as_ref().ok_or_else(|| {
@@ -2116,6 +2238,42 @@ mod tests {
         assert_eq!(decode.len(), 2);
         assert_eq!(decode[0].request_id, decode_a.request_id);
         assert_eq!(decode[1].request_id, decode_b.request_id);
+    }
+
+    #[test]
+    fn batch_phase_classifies_prefill_decode_and_mixed() {
+        let prompt = SequenceGroupMetadata {
+            request_id: RequestId(1),
+            is_prompt: true,
+            seq_data: [(SequenceId(10), make_seq_data(vec![1, 2, 3], vec![]))]
+                .into_iter()
+                .collect(),
+            sampling_params: rvllm_core::prelude::SamplingParams::default(),
+            block_tables: HashMap::new(),
+        };
+        let decode = SequenceGroupMetadata {
+            request_id: RequestId(2),
+            is_prompt: false,
+            seq_data: [(SequenceId(20), make_seq_data(vec![4, 5], vec![6]))]
+                .into_iter()
+                .collect(),
+            sampling_params: rvllm_core::prelude::SamplingParams::default(),
+            block_tables: HashMap::new(),
+        };
+
+        assert_eq!(GpuWorker::batch_phase(&[]), None);
+        assert_eq!(
+            GpuWorker::batch_phase(std::slice::from_ref(&prompt)),
+            Some(BatchPhase::Prefill)
+        );
+        assert_eq!(
+            GpuWorker::batch_phase(std::slice::from_ref(&decode)),
+            Some(BatchPhase::Decode)
+        );
+        assert_eq!(
+            GpuWorker::batch_phase(&[prompt, decode]),
+            Some(BatchPhase::Mixed)
+        );
     }
 
     #[test]
