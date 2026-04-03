@@ -192,6 +192,62 @@ jobs:
             --top-p "$HTTP_TOP_P" \
             --output "$BENCH_JSON"
 
+      - name: Write benchmark summary
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          direct_path = Path("artifacts/direct-benchmark.json")
+          http_path = Path("artifacts/http-benchmark.json")
+          summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"])
+
+          lines = ["## GPU Bench Summary", ""]
+
+          if direct_path.exists():
+              direct = json.loads(direct_path.read_text())
+              lines.append("### Direct Benchmark")
+              lines.append("")
+              lines.append(f"- Model: `{direct.get('model', 'unknown')}`")
+              lines.append(f"- Output length: `{direct.get('output_len', 'unknown')}`")
+              lines.append("")
+              lines.append("| N | Total tokens | Elapsed ms | tok/s | Failed |")
+              lines.append("|---|---:|---:|---:|---:|")
+              for row in direct.get("results", []):
+                  lines.append(
+                      f"| {row.get('n', '?')} | {row.get('total_tokens', '?')} | "
+                      f"{row.get('elapsed_ms', '?')} | {row.get('tok_per_sec', '?')} | "
+                      f"{row.get('failed', '?')} |"
+                  )
+              lines.append("")
+          else:
+              lines.append("### Direct Benchmark")
+              lines.append("")
+              lines.append("- No direct benchmark JSON artifact was produced.")
+              lines.append("")
+
+          if http_path.exists():
+              http = json.loads(http_path.read_text())
+              lines.append("### HTTP Benchmark")
+              lines.append("")
+              lines.append(f"- Successful requests: `{http.get('successful_requests', 'unknown')}`")
+              lines.append(f"- Total time: `{http.get('total_time_sec', 'unknown')}` sec")
+              lines.append(f"- Throughput: `{http.get('throughput_tok_per_sec', 'unknown')}` tok/s")
+              lines.append(f"- Requests/s: `{http.get('requests_per_sec', 'unknown')}`")
+              lines.append(f"- Avg latency: `{http.get('avg_latency_ms', 'unknown')}` ms")
+              lines.append(f"- P95 latency: `{http.get('p95_latency_ms', 'unknown')}` ms")
+              lines.append(f"- Errors: `{http.get('num_errors', 'unknown')}`")
+          else:
+              lines.append("### HTTP Benchmark")
+              lines.append("")
+              lines.append("- No HTTP benchmark JSON artifact was produced.")
+
+          summary_path.write_text("\n".join(lines) + "\n")
+          PY
+
       - name: Capture post-benchmark GPU state
         if: always()
         run: nvidia-smi | tee artifacts/nvidia-smi-after.txt

@@ -105,6 +105,38 @@ jobs:
             2> artifacts/direct-smoke.log
           cat artifacts/direct-smoke.log
 
+      - name: Write smoke summary
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          summary = Path("artifacts/direct-smoke.json")
+          out = Path(os.environ["GITHUB_STEP_SUMMARY"])
+
+          lines = ["## GPU Smoke Summary", ""]
+          if summary.exists():
+              data = json.loads(summary.read_text())
+              lines.append(f"- Model: `{data.get('model', 'unknown')}`")
+              lines.append(f"- Output length: `{data.get('output_len', 'unknown')}`")
+              lines.append("")
+              lines.append("| N | Total tokens | Elapsed ms | tok/s | Failed |")
+              lines.append("|---|---:|---:|---:|---:|")
+              for row in data.get("results", []):
+                  lines.append(
+                      f"| {row.get('n', '?')} | {row.get('total_tokens', '?')} | "
+                      f"{row.get('elapsed_ms', '?')} | {row.get('tok_per_sec', '?')} | "
+                      f"{row.get('failed', '?')} |"
+                  )
+          else:
+              lines.append("- No direct smoke JSON artifact was produced.")
+
+          out.write_text("\n".join(lines) + "\n")
+          PY
+
       - name: Upload smoke artifacts
         if: always()
         uses: actions/upload-artifact@v7
@@ -112,4 +144,3 @@ jobs:
           name: gpu-smoke-${{ github.run_id }}
           path: artifacts/
           if-no-files-found: error
-
