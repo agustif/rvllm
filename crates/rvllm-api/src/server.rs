@@ -4,6 +4,7 @@
 //! inference. It fails fast instead of falling back to a mock executor.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ use axum::Router;
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 use rvllm_config::EngineConfig;
 use rvllm_core::prelude::RequestId;
@@ -80,9 +81,16 @@ impl InferenceEngine for rvllm_engine::AsyncGpuLLMEngine {
 }
 
 /// Shared application state available to all route handlers.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelCapabilities {
+    pub supports_embeddings: bool,
+    pub supports_input_images: bool,
+}
+
 pub struct AppState {
     pub engine: Arc<dyn InferenceEngine>,
     pub model_name: String,
+    pub capabilities: ModelCapabilities,
     pub tokenizer: Arc<RwLock<Tokenizer>>,
     /// Batch job store (None if batch API is not enabled).
     pub batch_store: Option<crate::routes::batch::SharedBatchStore>,
@@ -95,9 +103,24 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(engine: Arc<dyn InferenceEngine>, model_name: String, tokenizer: Tokenizer) -> Self {
+        Self::new_with_capabilities(
+            engine,
+            model_name,
+            tokenizer,
+            ModelCapabilities::default(),
+        )
+    }
+
+    pub fn new_with_capabilities(
+        engine: Arc<dyn InferenceEngine>,
+        model_name: String,
+        tokenizer: Tokenizer,
+        capabilities: ModelCapabilities,
+    ) -> Self {
         Self {
             engine,
             model_name,
+            capabilities,
             tokenizer: Arc::new(RwLock::new(tokenizer)),
             batch_store: Some(crate::routes::batch::create_batch_store(None)),
             response_store: Arc::new(RwLock::new(HashMap::new())),
@@ -161,6 +184,74 @@ async fn metrics_placeholder() -> &'static str {
     "# vllm-rs metrics endpoint\n"
 }
 
+fn architecture_supports_embeddings(architecture: &str) -> bool {
+    matches!(
+        architecture,
+        "BertModel"
+            | "RobertaModel"
+            | "XLMRobertaModel"
+            | "E5Model"
+            | "GTEModel"
+            | "BGEModel"
+            | "EmbeddingModel"
+            | "SentenceTransformer"
+    )
+}
+
+fn read_model_architecture(snapshot_dir: &Path) -> rvllm_core::prelude::Result<Option<String>> {
+    let config_path = snapshot_dir.join("config.json");
+    let content = std::fs::read_to_string(&config_path).map_err(|e| {
+        rvllm_core::prelude::LLMError::ModelError(format!(
+            "failed to read {}: {e}",
+            config_path.display()
+        ))
+    })?;
+    let json: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+        rvllm_core::prelude::LLMError::ModelError(format!("invalid config.json: {e}"))
+    })?;
+    Ok(json
+        .get("architectures")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .map(str::to_owned))
+}
+
+fn detect_model_capabilities(model_name: &str) -> ModelCapabilities {
+    let architecture = match rvllm_engine::hf_snapshot::ensure_snapshot(model_name)
+        .and_then(|snapshot| read_model_architecture(&snapshot))
+    {
+        Ok(arch) => arch,
+        Err(e) => {
+            warn!(
+                model = model_name,
+                error = %e,
+                "failed to detect model capabilities, defaulting to text-only runtime"
+            );
+            None
+        }
+    };
+
+    let capabilities = ModelCapabilities {
+        supports_embeddings: architecture
+            .as_deref()
+            .map(architecture_supports_embeddings)
+            .unwrap_or(false),
+        // The runtime does not yet execute native image inputs.
+        supports_input_images: false,
+    };
+
+    info!(
+        model = model_name,
+        architecture = architecture.as_deref().unwrap_or("unknown"),
+        supports_embeddings = capabilities.supports_embeddings,
+        supports_input_images = capabilities.supports_input_images,
+        "detected model capabilities"
+    );
+
+    capabilities
+}
+
 fn cuda_gpu_available() -> bool {
     #[cfg(feature = "cuda")]
     {
@@ -195,6 +286,7 @@ pub async fn serve(config: EngineConfig) -> rvllm_core::prelude::Result<()> {
     info!(model = %model_name, "initializing engine");
 
     let tokenizer = Tokenizer::from_pretrained(&tokenizer_path)?;
+    let capabilities = detect_model_capabilities(&model_name);
 
     if !cuda_gpu_available() {
         return Err(rvllm_core::prelude::LLMError::GpuError(
@@ -205,7 +297,12 @@ pub async fn serve(config: EngineConfig) -> rvllm_core::prelude::Result<()> {
     info!("GPU detected, creating AsyncGpuLLMEngine for real inference");
     let engine: Arc<dyn InferenceEngine> = create_gpu_engine(config).await?;
 
-    let state = Arc::new(AppState::new(engine, model_name, tokenizer));
+    let state = Arc::new(AppState::new_with_capabilities(
+        engine,
+        model_name,
+        tokenizer,
+        capabilities,
+    ));
     let app = build_router(state);
 
     let host = std::env::var("VLLM_HOST").unwrap_or_else(|_| "0.0.0.0".into());
@@ -227,6 +324,18 @@ pub async fn serve(config: EngineConfig) -> rvllm_core::prelude::Result<()> {
 
     info!("server shut down gracefully");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedding_architectures_are_detected() {
+        assert!(architecture_supports_embeddings("BertModel"));
+        assert!(architecture_supports_embeddings("SentenceTransformer"));
+        assert!(!architecture_supports_embeddings("LlamaForCausalLM"));
+    }
 }
 
 /// Create the real GPU engine using AsyncGpuLLMEngine.

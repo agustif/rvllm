@@ -141,6 +141,12 @@ pub async fn create_embeddings(
             req.model, state.model_name
         )));
     }
+    if !state.capabilities.supports_embeddings {
+        return Err(ApiError::InvalidRequest(format!(
+            "loaded model '{}' does not expose embeddings on this runtime",
+            state.model_name
+        )));
+    }
 
     let texts = req.texts();
     info!(
@@ -243,6 +249,108 @@ fn mock_embedding_from_tokens(token_ids: &[u32]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, Mutex};
+
+    use crate::{build_router, AppState};
+    use axum_test::TestServer;
+    use rvllm_core::prelude::{CompletionOutput, RequestId, RequestOutput, SamplingParams};
+    use tokenizers::models::bpe::BPE;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
+    use tokenizers::Tokenizer as HfTokenizer;
+    use tokio::sync::Mutex as AsyncMutex;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    struct FakeEngine {
+        outputs: AsyncMutex<VecDeque<Vec<RequestOutput>>>,
+        prompts: Mutex<Vec<String>>,
+    }
+
+    impl FakeEngine {
+        fn new(outputs: Vec<Vec<RequestOutput>>) -> Self {
+            Self {
+                outputs: AsyncMutex::new(outputs.into()),
+                prompts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.prompts.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::server::InferenceEngine for FakeEngine {
+        async fn generate(
+            &self,
+            prompt: String,
+            _params: SamplingParams,
+        ) -> rvllm_core::prelude::Result<(RequestId, ReceiverStream<RequestOutput>)> {
+            self.prompts.lock().unwrap().push(prompt);
+            let maybe_outputs = self.outputs.lock().await.pop_front();
+            let outputs = maybe_outputs.expect("fake engine ran out of queued outputs");
+            let (tx, rx) = tokio::sync::mpsc::channel(outputs.len().max(1));
+            for output in outputs {
+                tx.send(output).await.unwrap();
+            }
+            drop(tx);
+            Ok((RequestId(1), ReceiverStream::new(rx)))
+        }
+    }
+
+    fn make_test_tokenizer() -> rvllm_tokenizer::Tokenizer {
+        let mut vocab = HashMap::new();
+        vocab.insert("hello".to_string(), 0);
+        vocab.insert("world".to_string(), 1);
+        vocab.insert("[UNK]".to_string(), 2);
+
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, vec![])
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+
+        let mut hf = HfTokenizer::new(bpe);
+        hf.with_pre_tokenizer(Some(Whitespace {}));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        hf.save(&path, false).unwrap();
+        rvllm_tokenizer::Tokenizer::from_file(&path).unwrap()
+    }
+
+    fn request_output(prompt_tokens: Vec<u32>) -> RequestOutput {
+        RequestOutput {
+            request_id: RequestId(1),
+            prompt: "hello world".into(),
+            prompt_token_ids: prompt_tokens,
+            prompt_logprobs: None,
+            outputs: vec![CompletionOutput {
+                index: 0,
+                text: String::new(),
+                token_ids: vec![],
+                cumulative_logprob: 0.0,
+                logprobs: None,
+                finish_reason: Some(rvllm_core::prelude::FinishReason::Stop),
+            }],
+            finished: true,
+        }
+    }
+
+    fn make_server(
+        capabilities: crate::server::ModelCapabilities,
+        outputs: Vec<Vec<RequestOutput>>,
+    ) -> (TestServer, Arc<FakeEngine>) {
+        let engine = Arc::new(FakeEngine::new(outputs));
+        let state = Arc::new(AppState::new_with_capabilities(
+            engine.clone(),
+            "test".to_string(),
+            make_test_tokenizer(),
+            capabilities,
+        ));
+        let server = TestServer::new(build_router(state)).unwrap();
+        (server, engine)
+    }
 
     #[test]
     fn embedding_request_validate_ok() {
@@ -386,5 +494,49 @@ mod tests {
         let json = serde_json::to_string(&u).unwrap();
         let back: EmbeddingUsage = serde_json::from_str(&json).unwrap();
         assert_eq!(back, u);
+    }
+
+    #[tokio::test]
+    async fn create_embeddings_route_rejects_text_only_runtime() {
+        let (server, engine) = make_server(
+            crate::server::ModelCapabilities::default(),
+            vec![vec![request_output(vec![1, 2, 3])]],
+        );
+
+        let response = server
+            .post("/v1/embeddings")
+            .json(&serde_json::json!({
+                "model": "test",
+                "input": "hello world"
+            }))
+            .await;
+
+        response.assert_status_bad_request();
+        assert!(engine.prompts().is_empty(), "engine should not be called");
+    }
+
+    #[tokio::test]
+    async fn create_embeddings_route_uses_supported_runtime() {
+        let (server, engine) = make_server(
+            crate::server::ModelCapabilities {
+                supports_embeddings: true,
+                supports_input_images: false,
+            },
+            vec![vec![request_output(vec![11, 22, 33])]],
+        );
+
+        let response = server
+            .post("/v1/embeddings")
+            .json(&serde_json::json!({
+                "model": "test",
+                "input": "hello world"
+            }))
+            .await;
+
+        response.assert_status_ok();
+        let body = response.json::<serde_json::Value>();
+        assert_eq!(body["object"], "list");
+        assert_eq!(body["data"][0]["object"], "embedding");
+        assert_eq!(engine.prompts().len(), 1);
     }
 }

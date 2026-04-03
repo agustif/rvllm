@@ -47,7 +47,7 @@ fn hf_model_error(model_name: &str, action: &str, error: &str) -> LLMError {
 }
 
 /// Resolve a Hugging Face repo id or local directory to a usable snapshot dir.
-pub(crate) fn ensure_snapshot(model_name: &str) -> Result<PathBuf> {
+pub fn ensure_snapshot(model_name: &str) -> Result<PathBuf> {
     let path = Path::new(model_name);
     if path.is_dir() {
         return Ok(path.to_path_buf());

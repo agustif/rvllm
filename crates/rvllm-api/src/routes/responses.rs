@@ -106,6 +106,19 @@ async fn collect_response_output(
     last_output.ok_or_else(|| ApiError::Internal("engine produced no output".into()))
 }
 
+fn input_items_include_images(items: &[ResponseInputItem]) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item,
+            ResponseInputItem::Message(message)
+                if message
+                    .content
+                    .iter()
+                    .any(|part| matches!(part, crate::types::responses::ResponseInputContentPart::InputImage(_)))
+        )
+    })
+}
+
 /// POST /v1/responses -- create a unified response.
 pub async fn create_response(
     State(state): State<Arc<AppState>>,
@@ -121,6 +134,11 @@ pub async fn create_response(
     }
 
     let input_items = req.normalize_input_items()?;
+    if input_items_include_images(&input_items) && !state.capabilities.supports_input_images {
+        return Err(ApiError::InvalidRequest(
+            "input_image parts are not yet supported by this runtime".into(),
+        ));
+    }
     let conversation_id = req.normalize_conversation_id()?;
     let mut conversation_items = base_conversation_items(&state, &req).await?;
     conversation_items.extend(
@@ -1850,7 +1868,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_response_route_accepts_input_image_parts() {
+    async fn create_response_route_rejects_input_image_parts_without_runtime_support() {
         let (server, engine) = make_server(vec![vec![request_output("done", true)]]);
 
         let response = server
@@ -1875,23 +1893,11 @@ mod tests {
             }))
             .await;
 
-        response.assert_status_ok();
-        let body = response.json::<serde_json::Value>();
-        let response_id = body["id"].as_str().unwrap();
-
-        let items = server
-            .get(&format!("/v1/responses/{response_id}/input_items"))
-            .await;
-        items.assert_status_ok();
-        let items = items.json::<serde_json::Value>();
-        assert_eq!(items["data"][0]["content"][1]["type"], "input_image");
-        assert_eq!(
-            items["data"][0]["content"][1]["image_url"],
-            "https://example.com/cat.png"
+        response.assert_status_bad_request();
+        assert!(
+            engine.prompts().is_empty(),
+            "engine should not be called for unsupported image input"
         );
-
-        let prompts = engine.prompts();
-        assert!(prompts[0].contains("[input_image url=https://example.com/cat.png detail=low]"));
     }
 
     #[tokio::test]
