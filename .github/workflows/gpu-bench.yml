@@ -1,0 +1,205 @@
+name: GPU Bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs_on:
+        description: 'JSON array of self-hosted runner labels'
+        required: true
+        default: '["self-hosted","linux","x64","nvidia","cuda"]'
+        type: string
+      rust_toolchain:
+        description: Rust toolchain
+        required: true
+        default: stable
+        type: string
+      cargo_features:
+        description: Cargo feature list passed to --features
+        required: true
+        default: cuda,cublaslt
+        type: string
+      model:
+        description: Model ID or local path for the benchmark run
+        required: true
+        default: Qwen/Qwen2.5-1.5B
+        type: string
+      dtype:
+        description: Dtype for benchmark and serve commands
+        required: true
+        default: half
+        type: string
+      direct_batches:
+        description: Comma-separated batch sizes for direct benchmark
+        required: true
+        default: 1,4,16,32
+        type: string
+      output_len:
+        description: Output tokens per request
+        required: true
+        default: "128"
+        type: string
+      http_concurrency:
+        description: Concurrent requests for the HTTP benchmark client
+        required: true
+        default: "16"
+        type: string
+      http_num_prompts:
+        description: Total HTTP requests to dispatch
+        required: true
+        default: "64"
+        type: string
+      http_temperature:
+        description: Temperature for HTTP benchmark requests
+        required: true
+        default: "0.0"
+        type: string
+      http_top_p:
+        description: Top-p for HTTP benchmark requests
+        required: true
+        default: "1.0"
+        type: string
+      port:
+        description: Local server port for the HTTP benchmark
+        required: true
+        default: "8000"
+        type: string
+      gpu_memory_utilization:
+        description: gpu-memory-utilization passed to serve/benchmark
+        required: true
+        default: "0.90"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: GPU bench
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 180
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      RUST_TOOLCHAIN: ${{ inputs.rust_toolchain }}
+      CARGO_FEATURES: ${{ inputs.cargo_features }}
+      MODEL: ${{ inputs.model }}
+      DTYPE: ${{ inputs.dtype }}
+      DIRECT_BATCHES: ${{ inputs.direct_batches }}
+      OUTPUT_LEN: ${{ inputs.output_len }}
+      HTTP_CONCURRENCY: ${{ inputs.http_concurrency }}
+      HTTP_NUM_PROMPTS: ${{ inputs.http_num_prompts }}
+      HTTP_TEMPERATURE: ${{ inputs.http_temperature }}
+      HTTP_TOP_P: ${{ inputs.http_top_p }}
+      PORT: ${{ inputs.port }}
+      GPU_MEMORY_UTILIZATION: ${{ inputs.gpu_memory_utilization }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2.9.1
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Python benchmark deps
+        run: python3 -m pip install --upgrade aiohttp
+
+      - name: Runner diagnostics
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          uname -a | tee artifacts/uname.txt
+          python3 --version | tee artifacts/python-version.txt
+          cargo --version | tee artifacts/cargo-version.txt
+          rustc --version | tee artifacts/rustc-version.txt
+          nvidia-smi | tee artifacts/nvidia-smi-before.txt
+
+      - name: Build rvllm
+        run: cargo build --release --features "$CARGO_FEATURES" -p rvllm
+
+      - name: Capture runtime info
+        run: ./target/release/rvllm info | tee artifacts/rvllm-info.txt
+
+      - name: Run direct benchmark
+        run: |
+          set -euo pipefail
+          ./target/release/rvllm benchmark \
+            --model "$MODEL" \
+            --dtype "$DTYPE" \
+            --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
+            --n "$DIRECT_BATCHES" \
+            --output-len "$OUTPUT_LEN" \
+            --json \
+            > artifacts/direct-benchmark.json \
+            2> artifacts/direct-benchmark.log
+          cat artifacts/direct-benchmark.log
+
+      - name: Run HTTP benchmark
+        run: |
+          set -euo pipefail
+          SERVER_LOG="artifacts/server.log"
+          BENCH_JSON="artifacts/http-benchmark.json"
+          cleanup() {
+            if [ -n "${SERVER_PID:-}" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+              kill "$SERVER_PID" 2>/dev/null || true
+              wait "$SERVER_PID" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          ./target/release/rvllm serve \
+            --model "$MODEL" \
+            --dtype "$DTYPE" \
+            --host 127.0.0.1 \
+            --port "$PORT" \
+            --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
+            > "$SERVER_LOG" 2>&1 &
+          SERVER_PID=$!
+          echo "$SERVER_PID" > artifacts/server.pid
+
+          for _ in $(seq 1 180); do
+            if curl -sf "http://127.0.0.1:${PORT}/health" > /dev/null; then
+              break
+            fi
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "server exited before becoming healthy" >&2
+              cat "$SERVER_LOG"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          curl -sf "http://127.0.0.1:${PORT}/health" > /dev/null
+
+          python3 deploy/benchmark_client.py \
+            --url "http://127.0.0.1:${PORT}" \
+            --model "$MODEL" \
+            --num-prompts "$HTTP_NUM_PROMPTS" \
+            --concurrent "$HTTP_CONCURRENCY" \
+            --max-tokens "$OUTPUT_LEN" \
+            --temperature "$HTTP_TEMPERATURE" \
+            --top-p "$HTTP_TOP_P" \
+            --output "$BENCH_JSON"
+
+      - name: Capture post-benchmark GPU state
+        if: always()
+        run: nvidia-smi | tee artifacts/nvidia-smi-after.txt
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gpu-bench-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error

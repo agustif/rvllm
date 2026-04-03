@@ -1,0 +1,115 @@
+name: GPU Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs_on:
+        description: 'JSON array of self-hosted runner labels'
+        required: true
+        default: '["self-hosted","linux","x64","nvidia","cuda"]'
+        type: string
+      rust_toolchain:
+        description: Rust toolchain
+        required: true
+        default: stable
+        type: string
+      cargo_features:
+        description: Cargo feature list passed to --features
+        required: true
+        default: cuda,cublaslt
+        type: string
+      model:
+        description: Model ID or local path for the smoke benchmark
+        required: true
+        default: Qwen/Qwen2.5-0.5B
+        type: string
+      dtype:
+        description: Dtype for benchmark command
+        required: true
+        default: half
+        type: string
+      output_len:
+        description: Output tokens for the smoke benchmark
+        required: true
+        default: "16"
+        type: string
+      benchmark_batch_size:
+        description: Batch size for the direct smoke benchmark
+        required: true
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    name: GPU smoke
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 60
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      RUST_TOOLCHAIN: ${{ inputs.rust_toolchain }}
+      CARGO_FEATURES: ${{ inputs.cargo_features }}
+      MODEL: ${{ inputs.model }}
+      DTYPE: ${{ inputs.dtype }}
+      OUTPUT_LEN: ${{ inputs.output_len }}
+      BENCHMARK_BATCH_SIZE: ${{ inputs.benchmark_batch_size }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2.9.1
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Runner diagnostics
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          uname -a | tee artifacts/uname.txt
+          python3 --version | tee artifacts/python-version.txt
+          cargo --version | tee artifacts/cargo-version.txt
+          rustc --version | tee artifacts/rustc-version.txt
+          nvidia-smi | tee artifacts/nvidia-smi.txt
+
+      - name: Build rvllm
+        run: cargo build --release --features "$CARGO_FEATURES" -p rvllm
+
+      - name: Probe CUDA runtime
+        run: ./target/release/rvllm info | tee artifacts/rvllm-info.txt
+
+      - name: Run direct smoke benchmark
+        run: |
+          set -euo pipefail
+          ./target/release/rvllm benchmark \
+            --model "$MODEL" \
+            --dtype "$DTYPE" \
+            --n "$BENCHMARK_BATCH_SIZE" \
+            --output-len "$OUTPUT_LEN" \
+            --json \
+            > artifacts/direct-smoke.json \
+            2> artifacts/direct-smoke.log
+          cat artifacts/direct-smoke.log
+
+      - name: Upload smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gpu-smoke-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+
