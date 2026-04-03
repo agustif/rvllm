@@ -1198,10 +1198,61 @@ impl GpuWorker {
         Ok(GpuWorkerOutput { outputs: Vec::new() })
     }
 
-    /// Execute with overlap: runs `during_gpu` closure while GPU computes.
-    /// The closure gets ~4ms of CPU time during the async graph replay path.
-    /// For sync paths (prefill, capture), the closure runs after GPU finishes.
-    pub fn execute_with_overlap<F: FnOnce()>(
+    // Split a scheduled step into prompt-processing and pure decode groups so
+    // mixed traffic does not force graph-eligible decode work down the prefill path.
+    fn split_phase_metadata(
+        metadata: &[SequenceGroupMetadata],
+    ) -> (Vec<SequenceGroupMetadata>, Vec<SequenceGroupMetadata>) {
+        let mut prefill = Vec::new();
+        let mut decode = Vec::new();
+
+        for group in metadata {
+            if group.is_prompt {
+                prefill.push(group.clone());
+            } else {
+                decode.push(group.clone());
+            }
+        }
+
+        (prefill, decode)
+    }
+
+    // Worker outputs are keyed by seq_id downstream, so we can merge sub-batch
+    // results without preserving batch-local ordering.
+    fn merge_worker_outputs(outputs: impl IntoIterator<Item = GpuWorkerOutput>) -> GpuWorkerOutput {
+        let mut merged = Vec::new();
+        for output in outputs {
+            merged.extend(output.outputs);
+        }
+        GpuWorkerOutput { outputs: merged }
+    }
+
+    fn execute_batch(&mut self, metadata: &[SequenceGroupMetadata]) -> Result<GpuWorkerOutput> {
+        if metadata.is_empty() {
+            return Ok(GpuWorkerOutput { outputs: Vec::new() });
+        }
+
+        let model_input = input::prepare_input(metadata, self.config.block_size)?;
+        let greedy_only = Self::all_greedy(metadata);
+        let fwd_output = self.gpu_forward_ex(&model_input, greedy_only)?;
+
+        let outputs = match fwd_output {
+            ForwardOutput::TokenIds(ref token_ids) => {
+                self.sample_tokens_from_gpu_argmax(token_ids, metadata)?
+            }
+            ForwardOutput::TokenIdsPending { actual_batch } => {
+                let token_ids = self.collect_pending_tokens(actual_batch)?;
+                self.sample_tokens_from_gpu_argmax(&token_ids, metadata)?
+            }
+            ForwardOutput::Logits(ref logits) => {
+                self.sample_tokens(logits, metadata)?
+            }
+        };
+
+        Ok(GpuWorkerOutput { outputs })
+    }
+
+    fn execute_batch_with_overlap<F: FnOnce()>(
         &mut self,
         metadata: &[SequenceGroupMetadata],
         during_gpu: F,
@@ -1232,7 +1283,36 @@ impl GpuWorker {
                 self.sample_tokens(logits, metadata)?
             }
         };
+
         Ok(GpuWorkerOutput { outputs })
+    }
+
+    /// Execute with overlap: runs `during_gpu` closure while GPU computes.
+    /// The closure gets ~4ms of CPU time during the async graph replay path.
+    /// For sync paths (prefill, capture), the closure runs after GPU finishes.
+    pub fn execute_with_overlap<F: FnOnce()>(
+        &mut self,
+        metadata: &[SequenceGroupMetadata],
+        during_gpu: F,
+    ) -> Result<GpuWorkerOutput> {
+        if metadata.is_empty() {
+            during_gpu();
+            return Ok(GpuWorkerOutput { outputs: Vec::new() });
+        }
+
+        let (prefill, decode) = Self::split_phase_metadata(metadata);
+        if !prefill.is_empty() && !decode.is_empty() {
+            debug!(
+                prefill_groups = prefill.len(),
+                decode_groups = decode.len(),
+                "splitting mixed worker batch into prefill + decode passes"
+            );
+            let prefill_output = self.execute_batch(&prefill)?;
+            let decode_output = self.execute_batch_with_overlap(&decode, during_gpu)?;
+            return Ok(Self::merge_worker_outputs([prefill_output, decode_output]));
+        }
+
+        self.execute_batch_with_overlap(metadata, during_gpu)
     }
 
     /// Execute one inference step with real GPU matmuls.
@@ -1244,6 +1324,35 @@ impl GpuWorker {
         }
 
         let t_start = std::time::Instant::now();
+
+        let (prefill, decode) = Self::split_phase_metadata(metadata);
+        if !prefill.is_empty() && !decode.is_empty() {
+            debug!(
+                prefill_groups = prefill.len(),
+                decode_groups = decode.len(),
+                "splitting mixed worker batch into prefill + decode passes"
+            );
+
+            let prefill_output = self.execute_batch(&prefill)?;
+            let t_prefill = t_start.elapsed();
+            let decode_output = self.execute_batch(&decode)?;
+            let t_total = t_start.elapsed();
+
+            // Periodic timing report (every 64 steps)
+            self.forward_count += 0; // already incremented in gpu_forward_ex
+            if self.forward_count % 64 == 0 && self.forward_count > 0 {
+                info!(
+                    prefill_us = t_prefill.as_micros(),
+                    decode_us = (t_total - t_prefill).as_micros(),
+                    total_us = t_total.as_micros(),
+                    prefill_groups = prefill.len(),
+                    decode_groups = decode.len(),
+                    "TIMING execute_split"
+                );
+            }
+
+            return Ok(Self::merge_worker_outputs([prefill_output, decode_output]));
+        }
 
         let model_input = input::prepare_input(metadata, self.config.block_size)?;
         let t_input = t_start.elapsed();
@@ -1880,6 +1989,7 @@ fn gpu_err(e: impl std::fmt::Display) -> LLMError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use rvllm_core::prelude::{RequestId, SequenceId};
 
     fn make_seq_data(prompt: Vec<TokenId>, output: Vec<TokenId>) -> SequenceData {
@@ -1966,5 +2076,71 @@ mod tests {
 
         // Layer 1 should still be empty
         assert_eq!(cache.keys(1).len(), 0);
+    }
+
+    #[test]
+    fn split_phase_metadata_preserves_relative_order() {
+        let prompt = SequenceGroupMetadata {
+            request_id: RequestId(1),
+            is_prompt: true,
+            seq_data: [(SequenceId(10), make_seq_data(vec![1, 2, 3], vec![]))]
+                .into_iter()
+                .collect(),
+            sampling_params: rvllm_core::prelude::SamplingParams::default(),
+            block_tables: HashMap::new(),
+        };
+        let decode_a = SequenceGroupMetadata {
+            request_id: RequestId(2),
+            is_prompt: false,
+            seq_data: [(SequenceId(20), make_seq_data(vec![4, 5], vec![6]))]
+                .into_iter()
+                .collect(),
+            sampling_params: rvllm_core::prelude::SamplingParams::default(),
+            block_tables: HashMap::new(),
+        };
+        let decode_b = SequenceGroupMetadata {
+            request_id: RequestId(3),
+            is_prompt: false,
+            seq_data: [(SequenceId(30), make_seq_data(vec![7, 8], vec![9]))]
+                .into_iter()
+                .collect(),
+            sampling_params: rvllm_core::prelude::SamplingParams::default(),
+            block_tables: HashMap::new(),
+        };
+        let metadata = vec![decode_a.clone(), prompt.clone(), decode_b.clone()];
+
+        let (prefill, decode) = GpuWorker::split_phase_metadata(&metadata);
+
+        assert_eq!(prefill.len(), 1);
+        assert_eq!(prefill[0].request_id, prompt.request_id);
+        assert_eq!(decode.len(), 2);
+        assert_eq!(decode[0].request_id, decode_a.request_id);
+        assert_eq!(decode[1].request_id, decode_b.request_id);
+    }
+
+    #[test]
+    fn merge_worker_outputs_appends_all_results() {
+        let merged = GpuWorker::merge_worker_outputs([
+            GpuWorkerOutput {
+                outputs: vec![GpuSamplerResult {
+                    seq_id: 1,
+                    token_id: 42,
+                    logprob: -0.1,
+                    top_logprobs: Vec::new(),
+                }],
+            },
+            GpuWorkerOutput {
+                outputs: vec![GpuSamplerResult {
+                    seq_id: 2,
+                    token_id: 99,
+                    logprob: -0.2,
+                    top_logprobs: Vec::new(),
+                }],
+            },
+        ]);
+
+        assert_eq!(merged.outputs.len(), 2);
+        assert_eq!(merged.outputs[0].seq_id, 1);
+        assert_eq!(merged.outputs[1].seq_id, 2);
     }
 }
